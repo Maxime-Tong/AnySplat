@@ -72,7 +72,6 @@ class Attention(nn.Module):
             v_subsampled,
             dropout_p=self.attn_drop.p if self.training else 0.0,
         )
-        print(x.shape)
         return x
         
     def forward(self, x: Tensor, pos=None, meta_info=None) -> Tensor:
