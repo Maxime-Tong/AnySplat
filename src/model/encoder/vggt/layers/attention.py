@@ -11,7 +11,6 @@ import logging
 import os
 import warnings
 
-import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -48,36 +47,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
         
-    def subsampling_attention(self, q, k, v, meta):
-        B, S, P, C = meta["shape"]
-        num_special_tokens = meta["num_special_tokens"]
-        
-        _, num_heads, _, head_dim = k.shape
-   
-        k = k.view(B, num_heads, S, P, head_dim)
-        v = v.view(B, num_heads, S, P, head_dim)
-        
-        k_special = k[:, :, :, :num_special_tokens, :]
-        v_special = v[:, :, :, :num_special_tokens, :]
-        
-        k_patches = k[:, :, :, num_special_tokens::4, :].contiguous()
-        v_patches = v[:, :, :, num_special_tokens::4, :].contiguous()
-        
-        k_subsampled = torch.cat([k_special, k_patches], dim=3).view(B, num_heads, -1, head_dim)
-        v_subsampled = torch.cat([v_special, v_patches], dim=3).view(B, num_heads, -1, head_dim)
-        
-        x = F.scaled_dot_product_attention(
-            q,
-            k_subsampled,
-            v_subsampled,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
-        )
-        print(x.shape)
-        return x
-        
-    def forward(self, x: Tensor, pos=None, meta_info=None) -> Tensor:
-        has_meta = meta_info is not None
-        
+    def forward(self, x: Tensor, pos=None) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -87,9 +57,7 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
         
-        if has_meta and meta_info["layer_idx"] >= 9 and meta_info["attn_type"] == "global":
-            x = self.subsampling_attention(q, k, v, meta_info)
-        elif self.fused_attn:
+        if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -110,7 +78,7 @@ class Attention(nn.Module):
 
 
 class MemEffAttention(Attention):
-    def forward(self, x: Tensor, attn_bias=None, pos=None, meta_info=None) -> Tensor:
+    def forward(self, x: Tensor, attn_bias=None, pos=None) -> Tensor:
         assert pos is None
         if not XFORMERS_AVAILABLE:
             if attn_bias is not None:

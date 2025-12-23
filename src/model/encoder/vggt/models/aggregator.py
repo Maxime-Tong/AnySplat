@@ -247,23 +247,16 @@ class Aggregator(nn.Module):
             required_layers = set(intermediate_layer_idx)
             # Always include the last layer for camera_head
             required_layers.add(self.depth - 1)
-            
+
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
-                meta_info = {
-                    "shape": (B, S, P, C),
-                    "num_special_tokens": self.patch_start_idx,
-                    "attn_type": attn_type,
-                    "layer_idx": layer_idx,
-                }
-                
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, meta_info, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, meta_info, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -288,11 +281,10 @@ class Aggregator(nn.Module):
         del global_intermediates
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, meta_info, frame_idx, pos=None):
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
-        B, S, P, C = meta_info["shape"]
         # If needed, reshape tokens or positions:
         if tokens.shape != (B * S, P, C):
             tokens = tokens.view(B, S, P, C).view(B * S, P, C)
@@ -309,33 +301,24 @@ class Aggregator(nn.Module):
                     self.frame_blocks[frame_idx],
                     tokens,
                     pos,
-                    meta_info,
                     use_reentrant=False,
                 )
             else:
-                tokens = self.frame_blocks[frame_idx](tokens, pos=pos, meta_info=meta_info)
+                tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, meta_info, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
-        B, S, P, C = meta_info["shape"]
-        if global_idx < 9:
-            if tokens.shape != (B * S, P, C):
-                tokens = tokens.view(B, S, P, C).view(B * S, P, C)
+        if tokens.shape != (B, S * P, C):
+            tokens = tokens.view(B, S, P, C).view(B, S * P, C)
 
-            if pos is not None and pos.shape != (B * S, P, 2):
-                pos = pos.view(B, S, P, 2).view(B * S, P, 2)
-        else:
-            if tokens.shape != (B, S * P, C):
-                tokens = tokens.view(B, S, P, C).view(B, S * P, C)
-
-            if pos is not None and pos.shape != (B, S * P, 2):
-                pos = pos.view(B, S, P, 2).view(B, S * P, 2)
+        if pos is not None and pos.shape != (B, S * P, 2):
+            pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
         intermediates = []
         
@@ -346,11 +329,10 @@ class Aggregator(nn.Module):
                     self.global_blocks[global_idx],
                     tokens,
                     pos,
-                    meta_info,
                     use_reentrant=False,
                 )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos, meta_info=meta_info)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
