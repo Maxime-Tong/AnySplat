@@ -1,20 +1,25 @@
-
-from pathlib import Path
-import matplotlib.pyplot as plt
-import torch
 import os
+from pathlib import Path
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import json
+import gzip
+import argparse
+import numpy as np
+from PIL import Image
 
-from src.misc.image_io import save_video
-from src.model.ply_export import export_ply
-from src.model.model.anysplat import AnySplat
+import torch
+import torch.nn as nn
+import torchvision
+from einops import rearrange
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
+
+from src.evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
+from misc.image_io import save_image, save_interpolated_video
 from src.utils.image import process_image
 
-import argparse
-
-OUT_FOLDER = "output/inference"
-os.makedirs(OUT_FOLDER, exist_ok=True)
+from src.model.model.anysplat import AnySplat
+from src.model.encoder.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 class CUDATimer:
     def __init__(self, print_prefix=""):
@@ -30,106 +35,110 @@ class CUDATimer:
     def __exit__(self, exc_type, exc_value, traceback):
         self.end_event.record()
         torch.cuda.synchronize()
-        elapsed_time_ms = self.start_event.elapsed_time(self.end_event)
-        print(f"{self.print_prefix}Elapsed time: {elapsed_time_ms:.2f} ms")
+        self.elapsed_time_ms = self.start_event.elapsed_time(self.end_event)
+        print(f"{self.print_prefix} Elapsed time: {self.elapsed_time_ms:.2f} ms")
 
-def render_video(
-    pred_extrinsics, pred_intrinsics, b, h, w, gaussians, save_path, decoder_func, SAVE_FLAG=False
-):
-    # Update K to reflect the new number of frames
-    num_frames = pred_extrinsics.shape[1]
-    
-    with torch.no_grad():
-        with CUDATimer("[Rendering video] "):
-            output = decoder_func.forward(
-                gaussians,
-                pred_extrinsics,
-                pred_intrinsics.float(),
-                torch.ones(1, num_frames, device=pred_extrinsics.device) * 0.1,
-                torch.ones(1, num_frames, device=pred_extrinsics.device) * 100,
-                (h, w),
-            )
+def setup_args():
+    """Set up command-line arguments for the eval NVS script."""
+    parser = argparse.ArgumentParser(description='Test AnySplat on NVS evaluation')
+    parser.add_argument('--data_dir', type=str, required=True, help='Path to NVS dataset')
+    parser.add_argument('--llffhold', type=int, default=8, help='LLFF holdout')
+    parser.add_argument('--output_path', type=str, default="outputs/nvs", help='Path to output directory')
+    parser.add_argument('--views', type=int, default=64, help='Number of context views')
+    parser.add_argument('--save', action='store_true', help='Whether to save the output images and videos')
+    return parser.parse_args()
 
-    # Convert to video format
-    video = output.color[0].clip(min=0, max=1)
-    depth = output.depth[0]
-    
-    # Normalize depth for visualization
-    # to avoid `quantile() input tensor is too large`
-    num_views = pred_extrinsics.shape[1] 
-    depth_norm = (depth - depth[::num_views].quantile(0.01)) / (
-        depth[::num_views].quantile(0.99) - depth[::num_views].quantile(0.01)
-    )
-    depth_norm = plt.cm.turbo(depth_norm.cpu().numpy())
-    depth_colored = (
-        torch.from_numpy(depth_norm[..., :3]).permute(0, 3, 1, 2).to(depth.device)
-    )
-    depth_colored = depth_colored.clip(min=0, max=1)
+def compute_metrics(pred_image, image):
+    psnr = compute_psnr(pred_image, image)
+    ssim = compute_ssim(pred_image, image)
+    lpips = compute_lpips(pred_image, image)
+    return psnr, ssim, lpips
 
-    if SAVE_FLAG:
-        # Save depth video
-        save_video(depth_colored, os.path.join(save_path, f"depth.mp4"))
-        # Save video
-        save_video(video, os.path.join(save_path, f"rgb.mp4"))
-        
-    return os.path.join(save_path, f"rgb.mp4"), os.path.join(save_path, f"depth.mp4")
-
-def sample_images(images, num_views):
-    total_views = len(images)
-    if total_views <= 100:
-        return images
-    interval = total_views / 100
-    selected_indices = [int(i * interval) for i in range(100)][:num_views]
-    sampled_images = [images[i] for i in selected_indices]
-    return sampled_images
-
-def calc_metric(pred, gt):
-    mse = torch.mean((pred - gt) ** 2).item()
-    psnr = -10 * torch.log10(torch.tensor(mse)).item()
-    print(f"[Metric] PSNR: {psnr} dB")
-    return psnr
-
-def main(args):
-    SAVE_FLAG = args.save
-    # Load the model from Hugging Face
+def evaluate(args: argparse.Namespace):
     model = AnySplat.from_pretrained("lhjiang/anysplat", cache_dir="./pretrained_models/anysplat")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    model.to(device)
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
     
-    # Load Images
-    image_folder = args.data
-    images = sorted([os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-    images = sample_images(images, args.v)
-    
-    print(f"Using {len(images)} images for inference.")
-    
-    images = [process_image(img_path) for img_path in images]
-    images = torch.stack(images, dim=0).unsqueeze(0).to(device) # [1, K, 3, 448, 448]
-    b, v, _, h, w = images.shape
-    
-    # Run Inference
-    with torch.no_grad():
-        with CUDATimer("[Running inference] "):
-            gaussians, pred_context_pose = model.inference((images+1)*0.5)
+    os.makedirs(args.output_path, exist_ok=True)
 
-    # Save the results
-    pred_all_extrinsic = pred_context_pose['extrinsic']
-    pred_all_intrinsic = pred_context_pose['intrinsic']
+    # load images
+    image_folder = args.data_dir
+    image_names = sorted([os.path.join(image_folder, f) for f in os.listdir(image_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     
-    print("Rendering video...")
-    render_video(pred_all_extrinsic, pred_all_intrinsic, b, h, w, gaussians, args.out, model.decoder, SAVE_FLAG=args.save)
-    if args.save:
-        export_ply(gaussians.means[0], gaussians.scales[0], gaussians.rotations[0], gaussians.harmonics[0], gaussians.opacities[0], Path(args.out) / "gaussians.ply")
+    if args.views != -1:
+        num_ctx = args.views
+        num_tgt = args.views // args.llffhold
+        num_frames = num_ctx + num_tgt
+        image_names = image_names[:num_frames]
         
+    images = [process_image(img_path) for img_path in image_names]
+    ctx_indices = [idx for idx, name in enumerate(image_names) if idx % args.llffhold != 0][:num_ctx]
+    tgt_indices = [idx for idx, name in enumerate(image_names) if idx % args.llffhold == 0][:num_tgt]
+
+    ctx_images = torch.stack([images[i] for i in ctx_indices], dim=0).unsqueeze(0).to(device)
+    tgt_images = torch.stack([images[i] for i in tgt_indices], dim=0).unsqueeze(0).to(device)
+    ctx_images = (ctx_images+1)*0.5
+    tgt_images = (tgt_images+1)*0.5
+    b, v, _, h, w = tgt_images.shape
+
+    # run inference
+    with CUDATimer("[Running inference]"):
+        encoder_output = model.encoder(
+            ctx_images,
+            global_step=0,
+            visualization_dump={},
+        )
+    gaussians, pred_context_pose = encoder_output.gaussians, encoder_output.pred_context_pose
+
+    num_context_view = ctx_images.shape[1]
+    vggt_input_image = torch.cat((ctx_images, tgt_images), dim=1).to(torch.bfloat16)
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=False, dtype=torch.bfloat16):
+        aggregated_tokens_list, patch_start_idx = model.encoder.aggregator(vggt_input_image, intermediate_layer_idx=model.encoder.cfg.intermediate_layer_idx)
+    with torch.cuda.amp.autocast(enabled=False):
+        fp32_tokens = [token.float() for token in aggregated_tokens_list]
+        pred_all_pose_enc = model.encoder.camera_head(fp32_tokens)[-1]
+        pred_all_extrinsic, pred_all_intrinsic = pose_encoding_to_extri_intri(pred_all_pose_enc, vggt_input_image.shape[-2:])
+
+    extrinsic_padding = torch.tensor([0, 0, 0, 1], device=pred_all_extrinsic.device, dtype=pred_all_extrinsic.dtype).view(1, 1, 1, 4).repeat(b, vggt_input_image.shape[1], 1, 1)
+    pred_all_extrinsic = torch.cat([pred_all_extrinsic, extrinsic_padding], dim=2).inverse()
+
+    pred_all_intrinsic[:, :, 0] = pred_all_intrinsic[:, :, 0] / w
+    pred_all_intrinsic[:, :, 1] = pred_all_intrinsic[:, :, 1] / h
+    pred_all_context_extrinsic, pred_all_target_extrinsic = pred_all_extrinsic[:, :num_context_view], pred_all_extrinsic[:, num_context_view:]
+    pred_all_context_intrinsic, pred_all_target_intrinsic = pred_all_intrinsic[:, :num_context_view], pred_all_intrinsic[:, num_context_view:]
+
+    scale_factor = pred_context_pose['extrinsic'][:, :, :3, 3].mean() / pred_all_context_extrinsic[:, :, :3, 3].mean()
+    pred_all_target_extrinsic[..., :3, 3] = pred_all_target_extrinsic[..., :3, 3] * scale_factor
+    pred_all_context_extrinsic[..., :3, 3] = pred_all_context_extrinsic[..., :3, 3] * scale_factor
+    print("scale_factor:", scale_factor)
+    
+    with CUDATimer("[Rendering video]"):
+        output = model.decoder.forward(
+            gaussians,
+            pred_all_target_extrinsic,
+            pred_all_target_intrinsic.float(),
+            torch.ones(1, v, device=device) * 0.01,
+            torch.ones(1, v, device=device) * 100,
+            (h, w)
+            )
+
+    if args.save:
+        save_interpolated_video(pred_all_context_extrinsic, pred_all_context_intrinsic, b, h, w, gaussians, args.output_path, model.decoder)
+    
+    # Save original images
+    save_path = Path(args.output_path)
+    # os.makedirs(save_path, exist_ok=True)
+    # for idx, (gt_image, pred_image) in enumerate(zip(tgt_images[0], output.color[0])):
+    #     save_image(gt_image, save_path / "gt" / f"{idx:0>6}.jpg")
+    #     save_image(pred_image, save_path / "pred" / f"{idx:0>6}.jpg")
+
+    # compute metrics
+    psnr, ssim, lpips = compute_metrics(output.color[0], tgt_images[0])
+    print(f"PSNR: {psnr.mean():.2f}, SSIM: {ssim.mean():.3f}, LPIPS: {lpips.mean():.3f}")
+
 if __name__ == "__main__":
-    # parse arguments
-    parser = argparse.ArgumentParser(description="AnySplat Inference Script")
-    parser.add_argument("--data", type=str, required=True, help="Path to the dataset images")
-    parser.add_argument("--v", type=int, default=64, help="Number of views")
-    parser.add_argument("--out", type=str, default=OUT_FOLDER, help="Output folder")
-    parser.add_argument("--save", action="store_true", help="Whether to save the outputs")
-    args = parser.parse_args()
-    main(args)
+    args = setup_args()
+    evaluate(args)
